@@ -1,0 +1,224 @@
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
+import time
+import sys
+import math
+
+# ================================
+#   CONFIGURAÇÃO DO DRIVER
+# ================================
+def iniciar_driver():
+    options = Options()
+    options.add_argument("--start-maximized")
+    # options.add_argument("--headless")  # ative se quiser rodar sem abrir janela
+    return webdriver.Chrome(options=options)
+
+def esperar(wait, condicao, timeout_msg="Tempo limite excedido."):
+    try:
+        return wait.until(condicao)
+    except TimeoutException:
+        raise Exception(timeout_msg)
+
+# ================================
+#   LOGIN
+# ================================
+def login(driver, wait, email, senha):
+    driver.get("https://e-reader.arvore.com.br/login")
+
+    campo_email = esperar(
+        wait,
+        EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email']")),
+        "Campo de email não encontrado."
+    )
+
+    campo_senha = driver.find_element(By.CSS_SELECTOR, "input[type='password']")
+
+    campo_email.send_keys(email)
+    campo_senha.send_keys(senha)
+
+    driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+
+# ================================
+#   ABRIR O LIVRO
+# ================================
+def abrir_livro(driver, wait, slug):
+    driver.get(f"https://e-reader.arvore.com.br/?slug={slug}")
+
+    esperar(
+        wait,
+        EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='reader-container']")),
+        "Leitor não carregou."
+    )
+
+# ================================
+#   UTIL: TENTAR OBTER TOTAL DE PÁGINAS
+# ================================
+def obter_total_pages(driver):
+    """
+    Tenta várias estratégias comuns para ler o total de páginas no leitor.
+    Retorna int total se encontrado, caso contrário None.
+    """
+    selectors = [
+        "[data-testid='total-pages']",
+        "[data-testid='pages-total']",
+        ".total-pages",
+        ".reader-total-pages",
+        ".pagination .total",
+        ".page-count .total",
+        "#total-pages",
+        ".total"
+    ]
+
+    for sel in selectors:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, sel)
+            text = el.text.strip()
+            # extrair número de possível formato "de 123" ou "123"
+            digits = ''.join(ch for ch in text if ch.isdigit())
+            if digits:
+                return int(digits)
+        except Exception:
+            continue
+
+    # tentar procurar um elemento que mostre "x / y" (ex: "12 / 300")
+    try:
+        candidates = driver.find_elements(By.XPATH, "//*[contains(text(),'/')]")
+        for c in candidates:
+            txt = c.text.strip()
+            if '/' in txt:
+                parts = txt.split('/')
+                if len(parts) >= 2:
+                    right = ''.join(ch for ch in parts[-1] if ch.isdigit())
+                    if right:
+                        return int(right)
+    except Exception:
+        pass
+
+    return None
+
+# ================================
+#   UTIL: BARRA DE PROGRESSO NO TERMINAL
+# ================================
+def imprimir_barra_progresso(current, total=None, width=30, prefix=""):
+    """
+    Se total for conhecido, imprime barra percentual.
+    Se total for None, imprime contador com spinner (indeterminado).
+    """
+    if total and total > 0:
+        pct = current / total
+        filled = int(math.floor(width * pct))
+        bar = "█" * filled + "-" * (width - filled)
+        sys.stdout.write(f"\r{prefix} |{bar}| {current}/{total} ({pct*100:5.1f}%)")
+    else:
+        # spinner
+        spinner = ['|', '/', '-', '\\']
+        spin = spinner[current % len(spinner)]
+        sys.stdout.write(f"\r{prefix} {spin} Página(s) virada(s): {current}")
+    sys.stdout.flush()
+
+# ================================
+#   VIRAR PÁGINAS ATÉ O FINAL (com barra)
+# ================================
+def virar_ate_o_final(driver, wait, intervalo=0.6, prefix="Lendo"):
+    """
+    Avança página por página até o fim.
+    - tenta descobrir o total (obter_total_pages)
+    - exibe barra de progresso no terminal
+    - intervalo: tempo (s) entre tentativas para carregar a próxima página
+    """
+    pagina = 0
+    total = obter_total_pages(driver)
+    if total:
+        print(f"🔎 Total de páginas detectado: {total}")
+    else:
+        print("🔎 Total de páginas não detectado — usando contador indeterminado.")
+
+    # loop principal
+    while True:
+        try:
+            botao_next = wait.until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='next-page-button']"))
+            )
+        except TimeoutException:
+            # se o botão não aparecer - pode ser fim do livro
+            print("\n📘 Nenhum botão de avançar encontrado → possivelmente fim do livro.")
+            break
+
+        # tentar clicar normalmente
+        try:
+            botao_next.click()
+        except (ElementClickInterceptedException, NoSuchElementException) as e:
+            # tentar via JS
+            try:
+                driver.execute_script("arguments[0].click();", botao_next)
+            except Exception:
+                print("\n❌ Não foi possível clicar no botão (normal ou JS). Saindo.")
+                break
+
+        pagina += 1
+
+        # atualizar total caso dinamicamente apareça depois
+        if total is None:
+            try:
+                maybe_total = obter_total_pages(driver)
+                if maybe_total:
+                    total = maybe_total
+                    print(f"\n🔔 Total de páginas encontrado dinamicamente: {total}")
+            except Exception:
+                pass
+
+        imprimir_barra_progresso(pagina, total, prefix=prefix)
+
+        # espera curta para próxima página carregar (não usar implicit_wait para esse delay)
+        time.sleep(intervalo)
+
+        # condição de segurança: se total conhecido e já alcançado, parar
+        if total and pagina >= total:
+            print("\n🏁 Chegou ao número total de páginas.")
+            break
+
+        # segurança extra: se o botão existir mas ficar desabilitado após clique, break
+        try:
+            # tentar reavaliar se o botão ainda está clicável; se não for, finaliza
+            still_clickable = botao_next.is_enabled() and botao_next.is_displayed()
+            if not still_clickable and total is None:
+                # aguarda um momento e testa buscar novamente (em algumas UI o mesmo botão some/permanece desabilitado)
+                time.sleep(0.5)
+                try:
+                    wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='next-page-button']")))
+                except TimeoutException:
+                    print("\n📛 Botão de avançar não está mais disponível → fim.")
+                    break
+        except Exception:
+            # se não for possível checar, apenas continuar e deixar o loop decidir
+            pass
+
+    print(f"\n✅ Finalizado! Total de páginas viradas: {pagina}")
+    return pagina, total
+
+# ================================
+#   CÓDIGO PRINCIPAL
+# ================================
+def main():
+    driver = iniciar_driver()
+    wait = WebDriverWait(driver, 20)
+
+    try:
+        login(driver, wait, "seu_email@exemplo.com", "sua_senha_segura")
+
+        slug = "harry-potter-e-a-pedra-filosofal"
+        abrir_livro(driver, wait, slug)
+
+        # → Aqui usa a função nova AUTOMÁTICA com barra de progresso
+        virar_ate_o_final(driver, wait, intervalo=0.6, prefix="Lendo:")
+
+    finally:
+        pass
+        # driver.quit()
+
+if __name__ == "__main__":
+    main()
